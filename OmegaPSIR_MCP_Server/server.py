@@ -1332,17 +1332,7 @@ async def handle_search_publications(
     year: int | None = None,
     limit: int = 25,
 ) -> str:
-    """
-    Search WUT publications: journal articles and books.
-
-    Priority order:
-      1. Researcher search by name or author_id (most reliable).
-
-    pub_type: "article", "book", or "all" (default).
-    Year filtering applied post-fetch when year_from/year_to/year are set.
-
-    Note: The WUT REST API does not support title/keyword or DOI search.
-    """
+   
     limit = min(max(1, limit), 100)
     matched_publications: list[dict] = []
     seen_publication_ids: set[str] = set()
@@ -1449,6 +1439,52 @@ async def handle_search_phd_theses(
         author_id=author_id,
         result_limit=min(max(1, limit), 100),
     )
+
+
+async def handle_search_by_topic(
+    topic: str = "",
+    pub_type: str = "all",
+    limit: int = 25,
+) -> str:
+    """
+    Search WUT publications by keyword / research topic.
+
+    Searches the keywordsEN field (then keywordsPL if no results) across
+    articles and/or books.  Returns all matching publications grouped by type.
+    """
+    if not topic.strip():
+        return json.dumps({"error": "topic parameter is required."}, ensure_ascii=False)
+
+    result_limit = min(max(1, limit), 100)
+    topic_stripped = topic.strip()
+
+    types_to_search: list[tuple[str, Any]] = []
+    if pub_type in ("all", "article"):
+        types_to_search.append(("article", parse_article_element))
+    if pub_type in ("all", "book"):
+        types_to_search.append(("book", parse_book_element))
+
+    matched: list[dict] = []
+    seen_ids: set[str] = set()
+
+    def _add(record: dict) -> None:
+        key = record.get("id") or record.get("doi") or record.get("title") or ""
+        if key and key not in seen_ids:
+            seen_ids.add(key)
+            matched.append(record)
+
+    for rec_type, parser in types_to_search:
+        for search_field in ("keywordsEN", "keywordsPL"):
+            elements = await search_wut_api(rec_type, search_field, topic_stripped, result_limit)
+            for elem in elements:
+                _add(parser(elem))
+            if matched:
+                break  # found results in EN keywords; skip PL retry for this type
+
+    n = len(matched)
+    pub_word = "publication" if n == 1 else "publications"
+    header = f"{n} {pub_word} found for topic \"{topic_stripped}\":"
+    return _fmt_publications_list(matched[:result_limit], header)
 
 
 # ---------------------------------------------------------------------------
@@ -1587,12 +1623,48 @@ TOOLS: list[Tool] = [
             },
         },
     ),
+    Tool(
+        name="search_by_topic",
+        description=(
+            "Search WUT publications by research topic or keyword.\n\n"
+            "Searches the keywordsEN and keywordsPL fields across journal articles "
+            "and books. Use this when you have a topic or research area (e.g. "
+            "'machine learning', 'neural networks', 'rough sets') rather than a "
+            "specific researcher name.\n\n"
+            "CRITICAL: The tool returns complete markdown tables. You MUST render every "
+            "table row exactly as returned — do NOT summarize, do NOT write 'highlights', "
+            "do NOT reduce the number of rows. Every publication has its own row. "
+            "Copy the tables verbatim; they ARE the answer."
+        ),
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "topic": {
+                    "type": "string",
+                    "description": "Research topic or keyword to search for (e.g. 'machine learning').",
+                },
+                "pub_type": {
+                    "type": "string",
+                    "enum": ["all", "article", "book"],
+                    "default": "all",
+                    "description": "Publication type filter.",
+                },
+                "limit": {
+                    "type": "integer",
+                    "default": 25,
+                    "description": "Maximum number of results to return (max 100).",
+                },
+            },
+            "required": ["topic"],
+        },
+    ),
 ]
 
 _TOOL_NAME_TO_HANDLER_MAP: dict[str, Any] = {
     "search_people":       handle_search_people,
     "search_publications": handle_search_publications,
     "search_phd_theses":   handle_search_phd_theses,
+    "search_by_topic":     handle_search_by_topic,
 }
 
 
