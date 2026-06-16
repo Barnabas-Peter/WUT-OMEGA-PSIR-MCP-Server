@@ -851,112 +851,6 @@ async def _resolve_researcher_to_profile(
     return False, ""
 
 
-async def _search_records_by_type(
-    record_type: str,
-    element_parser_function: Any,
-    researcher: str,
-    author_id: str | None,
-    result_limit: int,
-) -> str:
-    """
-    Generic publication/thesis search by researcher name or author_id.
-
-    For non-phd record types:
-      1. Resolve researcher → fetch by author.id, fallback to author.surname.
-
-    For phd record type:
-      Author and supervisor searches run ADDITIVELY (not as fallbacks) so that
-      a professor's name returns all theses they supervised, and a student's name
-      returns their own thesis — both in one call.
-      Priority: author.id + supervisor.id when record_id is known (specific);
-      author.surname + supervisor.surname when only a name is known.
-
-    Note: The WUT REST API does not support title/keyword search on any record type.
-    """
-    matched_records: list[dict] = []
-    seen_record_ids: set[str] = set()
-
-    def add_unique_record(record_xml_element: ET.Element) -> None:
-        parsed_record = element_parser_function(record_xml_element)
-        record_id = parsed_record.get("id", "")
-        deduplication_key = record_id or parsed_record.get("title", "")
-        if deduplication_key and deduplication_key not in seen_record_ids:
-            seen_record_ids.add(deduplication_key)
-            matched_records.append(parsed_record)
-
-    if researcher or author_id:
-        requires_disambiguation, resolved_profile = await _resolve_researcher_to_profile(researcher, author_id)
-        if requires_disambiguation:
-            return resolved_profile  # type: ignore[return-value]
-
-        _, surname = _split_full_name(
-            researcher or (resolved_profile.get("fullName", "") if isinstance(resolved_profile, dict) else "")
-        )
-
-        if isinstance(resolved_profile, dict) and resolved_profile:
-            researcher_record_id = resolved_profile.get("id", "")
-
-            if record_type == "phd":
-                # PhD theses need two simultaneous searches: one for the student
-                # (author.id / author.surname) and one for the supervisor
-                # (supervisor.id / supervisor.surname).  These are ADDITIVE, not
-                # fallbacks — a professor's name should return all theses they
-                # supervised, and a student's name should return their own thesis,
-                # both in a single call.  asyncio.gather fires both in parallel.
-                parallel_search_coroutines = []
-                if researcher_record_id:
-                    parallel_search_coroutines.append(
-                        search_wut_api("phd", "author.id", researcher_record_id, maximum_results=result_limit)
-                    )
-                    parallel_search_coroutines.append(
-                        search_wut_api("phd", "supervisor.id", researcher_record_id, maximum_results=result_limit)
-                    )
-                elif surname:
-                    parallel_search_coroutines.append(
-                        search_wut_api("phd", "author.surname", surname, maximum_results=result_limit)
-                    )
-                    parallel_search_coroutines.append(
-                        search_wut_api("phd", "supervisor.surname", surname, maximum_results=result_limit)
-                    )
-                for search_result_elements in await asyncio.gather(*parallel_search_coroutines):
-                    for record_xml_element in search_result_elements:
-                        add_unique_record(record_xml_element)
-                # If neither ID search yielded anything (e.g. the author is not
-                # indexed by WUT numeric ID), fall back to surname-based search.
-                if not matched_records and researcher_record_id and surname:
-                    for record_xml_element in await search_wut_api("phd", "author.surname", surname, maximum_results=result_limit):
-                        add_unique_record(record_xml_element)
-                    for record_xml_element in await search_wut_api("phd", "supervisor.surname", surname, maximum_results=result_limit):
-                        add_unique_record(record_xml_element)
-            else:
-                record_elements = []
-                if researcher_record_id:
-                    record_elements = await search_wut_api(record_type, "author.id", researcher_record_id, maximum_results=result_limit)
-                if not record_elements and surname:
-                    record_elements = await search_wut_api(record_type, "author.surname", surname, maximum_results=result_limit)
-                for record_xml_element in record_elements:
-                    add_unique_record(record_xml_element)
-
-        elif not resolved_profile:
-            if surname:
-                for record_xml_element in await search_wut_api(record_type, "author.surname", surname, maximum_results=result_limit):
-                    add_unique_record(record_xml_element)
-                if record_type == "phd":
-                    for record_xml_element in await search_wut_api(record_type, "supervisor.surname", surname, maximum_results=result_limit):
-                        add_unique_record(record_xml_element)
-
-    limited_matched_records = matched_records[:result_limit]
-    name_label = researcher or author_id or ""
-    n = len(limited_matched_records)
-    if record_type == "phd":
-        thesis_word = "PhD thesis" if n == 1 else "PhD theses"
-        header = f"{n} {thesis_word} found for {name_label}:" if name_label else f"{n} {thesis_word} found:"
-        return _fmt_theses_list(limited_matched_records, header)
-    pub_word = "publication" if n == 1 else "publications"
-    header = f"{n} {pub_word} found for {name_label}:" if name_label else f"{n} {pub_word} found:"
-    return _fmt_publications_list(limited_matched_records, header)
-
-
 # ---------------------------------------------------------------------------
 # Section 7b — Output formatters
 # ---------------------------------------------------------------------------
@@ -1365,17 +1259,13 @@ async def handle_search_publications(
         topic_stripped = topic.strip()
         for rec_type, parser in record_types_to_search:
             for search_field in ("keywordsEN", "keywordsPL"):
-                for elem in await search_wut_api(rec_type, search_field, topic_stripped, limit):
+                for elem in await search_wut_api(rec_type, search_field, topic_stripped, limit * 4):
                     add_unique_publication(parser(elem))
                 if matched_publications:
                     break
-        n = len(matched_publications[:limit])
-        pub_word = "publication" if n == 1 else "publications"
-        header = f"{n} {pub_word} found for topic \"{topic_stripped}\":"
-        return _fmt_publications_list(matched_publications[:limit], header)
 
     # --- researcher search ---
-    if researcher or author_id:
+    elif researcher or author_id:
         requires_disambiguation, researcher_profile = await _resolve_researcher_to_profile(researcher, author_id)
         if requires_disambiguation:
             return researcher_profile  # type: ignore[return-value]
@@ -1395,33 +1285,37 @@ async def handle_search_publications(
                 for record_element in await search_wut_api(record_type, "author.surname", surname, maximum_results=limit):
                     add_unique_publication(element_parser_function(record_element))
 
-    # --- year-only (no researcher) ---
+    # --- year-only (no researcher, no topic) ---
     elif year or year_from or year_to:
         return (
             "The WUT repository API does not support year-only searches. "
-            "Please provide a researcher name or author_id."
+            "Please provide a researcher name, author_id, or topic."
         )
 
-    # --- year filter (applied post-fetch) ---
+    # --- year filter (applied post-fetch, works for both researcher and topic searches) ---
     if year_from or year_to or year:
         year_range_start = year_from or (year if year else 1900)
         year_range_end   = year_to   or (year if year else 2099)
-        year_filtered_publications = []
-        for publication_record in matched_publications:
-            publication_year_string = publication_record.get("year", "")
-            if not publication_year_string:
-                year_filtered_publications.append(publication_record)
+        year_filtered: list[dict] = []
+        for pub in matched_publications:
+            pub_year = pub.get("year", "")
+            if not pub_year:
+                year_filtered.append(pub)
                 continue
             try:
-                publication_year_int = int(publication_year_string)
-                if year_range_start <= publication_year_int <= year_range_end:
-                    year_filtered_publications.append(publication_record)
+                if year_range_start <= int(pub_year) <= year_range_end:
+                    year_filtered.append(pub)
             except ValueError:
-                year_filtered_publications.append(publication_record)
-        matched_publications = year_filtered_publications
+                year_filtered.append(pub)
+        matched_publications = year_filtered
+
+    # Sort by year descending (most recent first)
+    matched_publications.sort(
+        key=lambda p: -(int(p["year"]) if str(p.get("year", "")).isdigit() else 0)
+    )
 
     limited_publications = matched_publications[:limit]
-    name_label = researcher or author_id or ""
+    name_label = researcher or author_id or (f'topic "{topic.strip()}"' if topic else "")
     year_parts = []
     if year:
         year_parts.append(str(year))
@@ -1437,23 +1331,92 @@ async def handle_search_publications(
 async def handle_search_phd_theses(
     researcher: str = "",
     author_id: str | None = None,
+    topic: str = "",
+    year_from: int | None = None,
+    year_to: int | None = None,
+    year: int | None = None,
     limit: int = 25,
 ) -> str:
     """
     Search WUT doctoral dissertations (PhD theses).
 
-    Searches by researcher name or author_id. Matches theses where the given name
-    is the thesis author OR the supervisor — both search paths are tried.
-
-    Note: The WUT REST API does not support title/keyword search on phd records.
+    Searches by researcher name/author_id (tries author and supervisor paths),
+    or by topic keyword (searches keywordsEN then keywordsPL).
+    Year filtering and descending sort are applied after fetching.
     """
-    return await _search_records_by_type(
-        record_type="phd",
-        element_parser_function=parse_phd_thesis_element,
-        researcher=researcher,
-        author_id=author_id,
-        result_limit=min(max(1, limit), 100),
-    )
+    limit = min(max(1, limit), 100)
+    matched: list[dict] = []
+    seen_ids: set[str] = set()
+
+    def add_unique(record: dict) -> None:
+        key = record.get("id") or record.get("title", "")
+        if key and key not in seen_ids:
+            seen_ids.add(key)
+            matched.append(record)
+
+    if topic and not researcher and not author_id:
+        topic_stripped = topic.strip()
+        for search_field in ("keywordsEN", "keywordsPL"):
+            for elem in await search_wut_api("phd", search_field, topic_stripped, limit * 4):
+                add_unique(parse_phd_thesis_element(elem))
+            if matched:
+                break
+    else:
+        if researcher or author_id:
+            requires_disambiguation, profile = await _resolve_researcher_to_profile(researcher, author_id)
+            if requires_disambiguation:
+                return profile  # type: ignore[return-value]
+            if not profile:
+                return f"No WUT researcher found for '{researcher or author_id}'."
+            assert isinstance(profile, dict)
+            rec_id = profile.get("id", "")
+            _, surname = _split_full_name(researcher or profile.get("fullName", ""))
+            searches = []
+            if rec_id:
+                searches = [("author.id", rec_id), ("supervisor.id", rec_id)]
+            elif surname:
+                searches = [("author.surname", surname), ("supervisor.surname", surname)]
+            results_lists = await asyncio.gather(*[
+                search_wut_api("phd", field, val, limit) for field, val in searches
+            ])
+            for elems in results_lists:
+                for elem in elems:
+                    add_unique(parse_phd_thesis_element(elem))
+        else:
+            return "Please provide a researcher name, author_id, or topic."
+
+    # Year filter
+    if year_from or year_to or year:
+        year_start = year_from or (year if year else 1900)
+        year_end   = year_to   or (year if year else 2099)
+        filtered: list[dict] = []
+        for thesis in matched:
+            y = thesis.get("year", "")
+            if not y:
+                filtered.append(thesis)
+                continue
+            try:
+                if year_start <= int(y) <= year_end:
+                    filtered.append(thesis)
+            except ValueError:
+                filtered.append(thesis)
+        matched = filtered
+
+    # Sort by year descending
+    matched.sort(key=lambda t: -(int(t["year"]) if str(t.get("year", "")).isdigit() else 0))
+
+    limited = matched[:limit]
+    name_label = researcher or author_id or (f'topic "{topic.strip()}"' if topic else "")
+    year_parts = []
+    if year:
+        year_parts.append(str(year))
+    elif year_from or year_to:
+        year_parts.append(f"{year_from or ''}–{year_to or ''}")
+    year_suffix = f" ({', '.join(year_parts)})" if year_parts else ""
+    n = len(limited)
+    word = "PhD thesis" if n == 1 else "PhD theses"
+    header = f"{n} {word} found for {name_label}{year_suffix}:" if name_label else f"{n} {word} found{year_suffix}:"
+    return _fmt_theses_list(limited, header)
 
 
 
@@ -1575,11 +1538,15 @@ TOOLS: list[Tool] = [
         name="search_phd_theses",
         description=(
             "Search WUT doctoral dissertations (PhD theses) in the OMEGA-PSIR repository.\n\n"
-            "Search by researcher name or author_id. Automatically tries both the thesis author\n"
-            "and the supervisor — so a supervisor's name will return their supervised theses.\n"
-            "Returns: title (EN/PL), author, supervisor, year, defence date, abstracts, keywords.\n\n"
-            "IMPORTANT: Present the tool output exactly as returned — do not reformat, "
-            "summarise, or omit any fields. Always show the Record URL for every thesis entry."
+            "Supports three search modes:\n"
+            "• researcher / author_id — finds theses where the person is the author OR supervisor.\n"
+            "• topic — keyword/subject search (English or Polish keywords).\n"
+            "• year_from / year_to / year — narrow results to a date range (combine with other params).\n\n"
+            "Use year_from/year_to or year to filter by defence year. "
+            "Results are sorted newest-first so 'find the latest PhD thesis on X' works naturally.\n\n"
+            "CRITICAL: Copy the table returned by this tool verbatim into your response. "
+            "Do NOT reformat, summarise, reorder, or omit any rows or columns. "
+            "The table IS the answer — every row, every link, every year."
         ),
         inputSchema={
             "type": "object",
@@ -1591,6 +1558,22 @@ TOOLS: list[Tool] = [
                 "author_id": {
                     "type": "string",
                     "description": "WUT numeric ID or URN for the researcher.",
+                },
+                "topic": {
+                    "type": "string",
+                    "description": "Keyword or subject to search for (e.g. 'machine learning', 'neural networks'). Searches English and Polish keyword fields.",
+                },
+                "year_from": {
+                    "type": "integer",
+                    "description": "Earliest defence year to include (inclusive).",
+                },
+                "year_to": {
+                    "type": "integer",
+                    "description": "Latest defence year to include (inclusive).",
+                },
+                "year": {
+                    "type": "integer",
+                    "description": "Exact defence year — shorthand for year_from=year and year_to=year.",
                 },
                 "limit": {
                     "type": "integer",
